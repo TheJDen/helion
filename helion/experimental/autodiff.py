@@ -268,12 +268,39 @@ class FXToHelionConverter:
         return None
 
     def _generate_shape_aware_code(
-        self, op_name: str, node: Node, arg_vars: list[str]
+        self,
+        op_name: str,
+        node: Node,
+        arg_vars: list[str],
+        node_to_var: dict[str, str],
     ) -> str | None:
-        """Generate code for shape-changing ops (expand, view) with dynamic shapes.
+        """Generate code for shape-changing ops (expand, view, unsqueeze).
 
         Returns generated code string, or None if this op doesn't need special handling.
         """
+        if op_name == "unsqueeze":
+            # Convert unsqueeze to view to work around Helion's unsqueeze
+            # lowering issue on 1D tiles. unsqueeze(tensor, dim) where
+            # tensor is 1D becomes tensor.view(tensor.shape[0], 1).
+            dim_arg = node.args[1] if len(node.args) > 1 else None
+            if dim_arg is not None:
+                input_node = node.args[0]
+                assert isinstance(input_node, Node)
+                input_var = node_to_var.get(input_node.name, arg_vars[0])
+                # Build view shape: insert 1 at the unsqueeze dim
+                # For the common case of unsqueeze(-1) on a 1D tensor:
+                # view(shape[0], 1)
+                input_meta = input_node.meta.get("val")
+                if input_meta is not None:
+                    ndim = input_meta.ndim
+                    dim = dim_arg if dim_arg >= 0 else ndim + 1 + dim_arg
+                    shape_parts = []
+                    for i in range(ndim):
+                        shape_parts.append(f"{input_var}.shape[{i}]")
+                    shape_parts.insert(dim, "1")
+                    return f"{input_var}.view({', '.join(shape_parts)})"
+            return None
+
         if op_name == "expand":
             # expand(tensor, [M, N]) -> expand_as(matching_input_tile)
             shape_arg = node.args[1]
@@ -283,8 +310,8 @@ class FXToHelionConverter:
                     return f"{arg_vars[0]}.expand_as({match}_tile)"
             return None
 
-        if op_name == "view" or op_name == "reshape":
-            # view(tensor, [M, 1]) -> unsqueeze / view with dynamic shape
+        if op_name in ("view", "reshape"):
+            # view(tensor, [M, 1]) -> view with dynamic shape
             shape_arg = node.args[1]
             if isinstance(shape_arg, (list, tuple)):
                 shape_tuple = tuple(shape_arg)
@@ -292,36 +319,39 @@ class FXToHelionConverter:
                 match = self._find_tensor_by_shape(shape_tuple)
                 if match:
                     return f"{arg_vars[0]}.view({match}_tile.shape)"
-                # Detect unsqueeze-like patterns: grad_out_shape + trailing 1s
-                # e.g., grad_out shape [M] -> view [M, 1]
-                grad_shape = self.grad_out_shape
-                if len(shape_tuple) > len(grad_shape):
-                    prefix = shape_tuple[: len(grad_shape)]
-                    suffix = shape_tuple[len(grad_shape) :]
-                    if prefix == grad_shape and all(s == 1 for s in suffix):
-                        unsqueezes = "".join(
-                            ".unsqueeze(-1)" for _ in suffix
-                        )
-                        return f"{arg_vars[0]}{unsqueezes}"
-                # Check against input tensor shapes with trailing 1s
+                # Build dynamic view shape by matching dims against known shapes
                 for name, tensor_shape in self.tensor_shapes.items():
-                    if len(shape_tuple) > len(tensor_shape):
+                    if len(shape_tuple) != len(tensor_shape):
                         continue
-                    # Match shape with 1s replacing some dims
-                    if len(shape_tuple) == len(tensor_shape):
-                        dynamic_dims = []
-                        for i, (s, t) in enumerate(
-                            zip(shape_tuple, tensor_shape, strict=True)
-                        ):
-                            if s == t:
-                                dynamic_dims.append(f"{name}_tile.shape[{i}]")
-                            elif s == 1:
-                                dynamic_dims.append("1")
-                            else:
-                                break
+                    dynamic_dims = []
+                    for i, (s, t) in enumerate(
+                        zip(shape_tuple, tensor_shape, strict=True)
+                    ):
+                        if s == t:
+                            dynamic_dims.append(f"{name}_tile.shape[{i}]")
+                        elif s == 1:
+                            dynamic_dims.append("1")
                         else:
-                            shape_expr = ", ".join(dynamic_dims)
-                            return f"{arg_vars[0]}.view({shape_expr})"
+                            break
+                    else:
+                        shape_expr = ", ".join(dynamic_dims)
+                        return f"{arg_vars[0]}.view({shape_expr})"
+                # Check against grad_out shape
+                grad_shape = self.grad_out_shape
+                if len(shape_tuple) == len(grad_shape):
+                    dynamic_dims = []
+                    for i, (s, g) in enumerate(
+                        zip(shape_tuple, grad_shape, strict=True)
+                    ):
+                        if s == g:
+                            dynamic_dims.append(f"grad_out_tile.shape[{i}]")
+                        elif s == 1:
+                            dynamic_dims.append("1")
+                        else:
+                            break
+                    else:
+                        shape_expr = ", ".join(dynamic_dims)
+                        return f"{arg_vars[0]}.view({shape_expr})"
             return None
 
         return None
@@ -377,7 +407,9 @@ class FXToHelionConverter:
             # Try shape-aware codegen for expand/view ops
             code = None
             if op_name is not None:
-                code = self._generate_shape_aware_code(op_name, node, arg_vars)
+                code = self._generate_shape_aware_code(
+                    op_name, node, arg_vars, node_to_var
+                )
 
             if code is None:
                 # Generate op code: torch function or tensor method
