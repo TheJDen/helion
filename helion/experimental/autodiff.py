@@ -116,55 +116,58 @@ class GraphAnalyzer:
                     tensor_current_value[tensor_name] = value_node
 
             elif target_name == "_mask_to":
-                # _mask_to(tensor, fill_value) pads masked tile elements.
-                # For differentiation we skip it — AOT Autograd traces with
-                # full concrete tensors that have no masked elements.
+                # _mask_to(tensor, fill_value) pads masked tile elements for
+                # reductions. The backward Helion kernel gets its own masking
+                # from the Helion compiler, so we pass through as identity.
                 input_node = node.args[0]
                 if isinstance(input_node, Node) and input_node in node_map:
                     node_map[node] = node_map[input_node]
 
-            elif not target_name.startswith("_"):
+            elif target_name == "_inductor_lowering_extra":
+                # Helion internal: holds references to input nodes that
+                # strip_unused_inputs moved out of the main op's args.
+                # Not computation — just track it so we can restore args.
+                pass
+
+            elif target_name.startswith("_"):
+                raise exc.AutodiffNotSupported(
+                    f"Helion internal op '{target_name}'"
+                )
+
+            else:
                 # Computation node: copy to computation graph
                 args = node.args
-                # Helion's strip_unused_inputs replaces duplicate node args with
-                # None when they map to the same input buffer. We restore the
-                # real arg for differentiate_graph. Also check _extra_args in
-                # kwargs — Helion uses this for ops like mean/amax where the
-                # input was moved to an internal _inductor_lowering_extra node.
+                # Helion's strip_unused_inputs replaces args with None when
+                # they reference a buffer already used by another arg. Restore
+                # them from _extra_args (which points to the
+                # _inductor_lowering_extra node holding the real inputs) or
+                # from the first remaining Node arg.
                 extra_args = node.kwargs.get("_extra_args")
                 if extra_args is not None and isinstance(extra_args, (list, tuple)):
                     for ea in extra_args:
                         if not isinstance(ea, Node):
                             continue
-                        ea_target = ea.target
-                        ea_name = (
-                            getattr(ea_target, "__name__", "")
-                            if callable(ea_target)
-                            else ""
-                        )
-                        if ea_name == "_inductor_lowering_extra":
-                            # _extra_args -> _inductor_lowering_extra([load])
-                            # Extract the real input nodes from the list arg
-                            real_inputs = ea.args[0]
-                            if isinstance(real_inputs, (list, tuple)):
-                                for ri in real_inputs:
-                                    if isinstance(ri, Node):
-                                        args = tuple(
-                                            ri if a is None else a
-                                            for a in args
-                                        )
-                                        break
+                        # _inductor_lowering_extra([real_input_node, ...])
+                        real_inputs = ea.args[0]
+                        if isinstance(real_inputs, (list, tuple)):
+                            for ri in real_inputs:
+                                if isinstance(ri, Node):
+                                    args = tuple(
+                                        ri if a is None else a
+                                        for a in args
+                                    )
+                                    break
 
                 first_node_arg = next((a for a in args if isinstance(a, Node)), None)
                 if first_node_arg is not None:
                     args = tuple(first_node_arg if a is None else a for a in args)
 
                 new_args = map_arg(args, node_map.get)
-                # Strip Helion-internal kwargs
+                # Strip _extra_args (Helion-internal kwarg)
                 clean_kwargs = {
                     k: v
                     for k, v in node.kwargs.items()
-                    if not k.startswith("_")
+                    if k != "_extra_args"
                 }
                 new_kwargs = map_arg(clean_kwargs, node_map.get)
                 target = node.target

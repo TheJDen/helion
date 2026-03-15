@@ -391,6 +391,44 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_out_shape=(64,),
         )
 
+    def test_sum_reduction_boundary(self):
+        """Test sum reduction with non-divisible sizes to verify masking."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: x.sum(-1),
+            1,
+            input_shapes=[(65, 33)],
+            grad_out_shape=(65,),
+        )
+
+    def test_amax_reduction_boundary(self):
+        """Test amax reduction with non-divisible sizes to verify masking."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = torch.amax(x[tile_m, :], dim=1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: torch.amax(x, dim=-1),
+            1,
+            input_shapes=[(65, 33)],
+            grad_out_shape=(65,),
+        )
+
     def test_error_multiple_tile_loops(self):
         @helion.kernel(autotune_effort="none")
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
