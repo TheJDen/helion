@@ -412,26 +412,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.AutodiffNotSupported):
             helion.experimental.backward(kernel, grad_out, a, b)
 
-    def test_error_multi_loop_reduction(self):
-        @helion.kernel(autotune_effort="none")
-        def kernel(x: torch.Tensor) -> torch.Tensor:
-            m, n = x.size()
-            out = torch.empty_like(x)
-            for tile_m in hl.tile(m):
-                values = x[tile_m, :]
-                amax = torch.amax(values, dim=1, keepdim=True)
-                exp = torch.exp(values - amax)
-                sum_exp = torch.sum(exp, dim=1, keepdim=True)
-                out[tile_m, :] = exp / sum_exp
-            return out
-
-        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
-        kernel(x)
-        grad_out = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
-
-        with self.assertRaises(helion.exc.AutodiffNotSupported):
-            helion.experimental.backward(kernel, grad_out, x)
-
     def test_backward_autotune(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

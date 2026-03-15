@@ -674,15 +674,17 @@ def backward(
         assert host_function is not None
         graphs = host_function.device_ir.graphs
 
+        # Reject kernels with non-reduction ForLoopGraphInfo (multiple tile loops)
+        for graph_info in graphs:
+            if isinstance(graph_info, ForLoopGraphInfo) and not isinstance(
+                graph_info, ReductionLoopGraphInfo
+            ):
+                raise exc.AutodiffNotSupported("multiple tile loops")
+
         # Find the RootGraphInfo — inline reductions produce additional
         # ReductionLoopGraphInfo graphs alongside the root, which we ignore.
         root_graphs = [g for g in graphs if isinstance(g, RootGraphInfo)]
         if len(root_graphs) != 1:
-            for graph_info in graphs:
-                if isinstance(graph_info, ForLoopGraphInfo) and not isinstance(
-                    graph_info, ReductionLoopGraphInfo
-                ):
-                    raise exc.AutodiffNotSupported("multiple tile loops")
             raise exc.AutodiffNotSupported("multiple graphs")
 
         fwd_graph = root_graphs[0].graph
