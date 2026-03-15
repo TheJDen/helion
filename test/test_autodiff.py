@@ -23,23 +23,33 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         pytorch_fn,
         n_inputs,
         shape=(128,),
+        input_shapes=None,
+        grad_out_shape=None,
         autotune=False,
         autotune_effort="none",
     ):
         """
         Validate helion.experimental.backward against PyTorch autograd.
 
-        Creates n_inputs random tensors of the given shape, runs the helion kernel
-        forward and backward, compares gradients against PyTorch autograd, and
-        checks assertExpectedJournal for both helion and triton code.
+        Creates n_inputs random tensors of the given shape (or per-input shapes
+        if input_shapes is provided), runs the helion kernel forward and backward,
+        compares gradients against PyTorch autograd, and checks
+        assertExpectedJournal for both helion and triton code.
 
         Returns (helion_code, triton_code) for additional assertions.
         """
-        inputs = [
-            torch.randn(*shape, device=DEVICE, dtype=torch.float32)
-            for _ in range(n_inputs)
-        ]
-        grad_out = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+        if input_shapes is not None:
+            inputs = [
+                torch.randn(*s, device=DEVICE, dtype=torch.float32)
+                for s in input_shapes
+            ]
+        else:
+            inputs = [
+                torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+                for _ in range(n_inputs)
+            ]
+        out_shape = grad_out_shape if grad_out_shape is not None else shape
+        grad_out = torch.randn(*out_shape, device=DEVICE, dtype=torch.float32)
 
         kernel_fn(*[inp.clone() for inp in inputs])
         result = helion.experimental.backward(
@@ -313,6 +323,74 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(load_store_load, lambda x: torch.sin(x * 2), 1)
 
+    def test_sum_reduction(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: x.sum(-1),
+            1,
+            input_shapes=[(64, 32)],
+            grad_out_shape=(64,),
+        )
+
+    def test_mean_reduction(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].mean(-1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: x.mean(-1),
+            1,
+            input_shapes=[(64, 32)],
+            grad_out_shape=(64,),
+        )
+
+    def test_amax_reduction(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = torch.amax(x[tile_m, :], dim=1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: torch.amax(x, dim=-1),
+            1,
+            input_shapes=[(64, 32)],
+            grad_out_shape=(64,),
+        )
+
+    def test_sum_mul_reduction(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = (x[tile_m, :] * y[tile_m, :]).sum(-1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x, y: (x * y).sum(-1),
+            2,
+            input_shapes=[(64, 32), (64, 32)],
+            grad_out_shape=(64,),
+        )
+
     def test_error_multiple_tile_loops(self):
         @helion.kernel(autotune_effort="none")
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -334,18 +412,22 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.AutodiffNotSupported):
             helion.experimental.backward(kernel, grad_out, a, b)
 
-    def test_error_reduction(self):
+    def test_error_multi_loop_reduction(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            m, n = x.size()
+            out = torch.empty_like(x)
             for tile_m in hl.tile(m):
-                out[tile_m] = x[tile_m, :].sum(-1)
+                values = x[tile_m, :]
+                amax = torch.amax(values, dim=1, keepdim=True)
+                exp = torch.exp(values - amax)
+                sum_exp = torch.sum(exp, dim=1, keepdim=True)
+                out[tile_m, :] = exp / sum_exp
             return out
 
         x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
         kernel(x)
-        grad_out = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        grad_out = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
 
         with self.assertRaises(helion.exc.AutodiffNotSupported):
             helion.experimental.backward(kernel, grad_out, x)

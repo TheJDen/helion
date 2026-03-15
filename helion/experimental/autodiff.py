@@ -29,6 +29,12 @@ class InputMapping:
     fake_tensor: torch.Tensor | None
 
 
+@dataclass
+class OutputMapping:
+    tensor_name: str
+    fake_tensor: torch.Tensor | None
+
+
 class GraphAnalyzer:
     """
     Analyzes forward Helion graph and extracts the pure computation subgraph.
@@ -46,13 +52,14 @@ class GraphAnalyzer:
 
     def extract_computation_graph(
         self,
-    ) -> tuple[torch.fx.Graph, list[InputMapping]]:
+    ) -> tuple[torch.fx.Graph, list[InputMapping], list[OutputMapping]]:
         """
         Extract computation subgraph.
 
         Returns:
             compute_graph: Pure PyTorch FX graph
             input_mappings: Load -> placeholder mappings
+            output_mappings: Store -> output tensor mappings
         """
         compute_graph = torch.fx.Graph()
         node_map: dict[Node, Node] = {}
@@ -123,17 +130,28 @@ class GraphAnalyzer:
                 assert callable(target)
                 new_node = compute_graph.call_function(target, new_args, new_kwargs)
                 if node.meta:
-                    new_node.meta = node.meta.copy()
+                    # Only preserve "val" metadata; strip Helion-internal keys
+                    new_node.meta = {
+                        k: v for k, v in node.meta.items() if k == "val"
+                    }
                 node_map[node] = new_node
 
         input_tensor_names = set(tensor_to_placeholder.keys())
-        outputs = [
-            node_map[v]
-            for t, v in tensor_current_value.items()
-            if t not in input_tensor_names
-        ]
+        output_mappings: list[OutputMapping] = []
+        outputs = []
+        for tensor_name, value_node in tensor_current_value.items():
+            if tensor_name not in input_tensor_names:
+                mapped_node = node_map[value_node]
+                outputs.append(mapped_node)
+                fake_tensor = mapped_node.meta.get("val") if mapped_node.meta else None
+                output_mappings.append(
+                    OutputMapping(
+                        tensor_name=tensor_name,
+                        fake_tensor=fake_tensor,
+                    )
+                )
         compute_graph.output(tuple(outputs))
-        return compute_graph, input_mappings
+        return compute_graph, input_mappings, output_mappings
 
 
 def differentiate_graph(
@@ -192,9 +210,11 @@ class FXToHelionConverter:
         backward_graph: torch.fx.Graph,
         input_mappings: list[InputMapping],
         input_tensors: tuple[torch.Tensor, ...],
+        grad_out_shape: tuple[int, ...],
     ) -> None:
         self.backward_graph = backward_graph
         self.grad_input_order = [m.tensor_name for m in input_mappings]
+        self.grad_out_shape = grad_out_shape
 
         # Map primal index (1-based from AOT Autograd) to tensor name
         self.primal_to_name = {
@@ -239,6 +259,72 @@ class FXToHelionConverter:
         if node_name.startswith("tangents_"):
             return "grad_out_tile"
         return f"{node_name}_val"
+
+    def _find_tensor_by_shape(self, shape: tuple[int, ...]) -> str | None:
+        """Match a concrete shape against known tensor shapes."""
+        for name, tensor_shape in self.tensor_shapes.items():
+            if tensor_shape == shape:
+                return name
+        return None
+
+    def _generate_shape_aware_code(
+        self, op_name: str, node: Node, arg_vars: list[str]
+    ) -> str | None:
+        """Generate code for shape-changing ops (expand, view) with dynamic shapes.
+
+        Returns generated code string, or None if this op doesn't need special handling.
+        """
+        if op_name == "expand":
+            # expand(tensor, [M, N]) -> expand_as(matching_input_tile)
+            shape_arg = node.args[1]
+            if isinstance(shape_arg, (list, tuple)):
+                match = self._find_tensor_by_shape(tuple(shape_arg))
+                if match:
+                    return f"{arg_vars[0]}.expand_as({match}_tile)"
+            return None
+
+        if op_name == "view" or op_name == "reshape":
+            # view(tensor, [M, 1]) -> unsqueeze / view with dynamic shape
+            shape_arg = node.args[1]
+            if isinstance(shape_arg, (list, tuple)):
+                shape_tuple = tuple(shape_arg)
+                # Check if it matches a known tensor shape
+                match = self._find_tensor_by_shape(shape_tuple)
+                if match:
+                    return f"{arg_vars[0]}.view({match}_tile.shape)"
+                # Detect unsqueeze-like patterns: grad_out_shape + trailing 1s
+                # e.g., grad_out shape [M] -> view [M, 1]
+                grad_shape = self.grad_out_shape
+                if len(shape_tuple) > len(grad_shape):
+                    prefix = shape_tuple[: len(grad_shape)]
+                    suffix = shape_tuple[len(grad_shape) :]
+                    if prefix == grad_shape and all(s == 1 for s in suffix):
+                        unsqueezes = "".join(
+                            ".unsqueeze(-1)" for _ in suffix
+                        )
+                        return f"{arg_vars[0]}{unsqueezes}"
+                # Check against input tensor shapes with trailing 1s
+                for name, tensor_shape in self.tensor_shapes.items():
+                    if len(shape_tuple) > len(tensor_shape):
+                        continue
+                    # Match shape with 1s replacing some dims
+                    if len(shape_tuple) == len(tensor_shape):
+                        dynamic_dims = []
+                        for i, (s, t) in enumerate(
+                            zip(shape_tuple, tensor_shape, strict=True)
+                        ):
+                            if s == t:
+                                dynamic_dims.append(f"{name}_tile.shape[{i}]")
+                            elif s == 1:
+                                dynamic_dims.append("1")
+                            else:
+                                break
+                        else:
+                            shape_expr = ", ".join(dynamic_dims)
+                            return f"{arg_vars[0]}.view({shape_expr})"
+            return None
+
+        return None
 
     def _generate_computation(
         self, computations: list[Node], placeholders: list[Node]
@@ -288,18 +374,24 @@ class FXToHelionConverter:
 
             arg_vars = [process_arg(arg) for arg in node.args]
 
-            # Generate op code: torch function or tensor method
-            if op_name is not None and arg_vars:
-                if hasattr(torch, op_name):
+            # Try shape-aware codegen for expand/view ops
+            code = None
+            if op_name is not None:
+                code = self._generate_shape_aware_code(op_name, node, arg_vars)
+
+            if code is None:
+                # Generate op code: torch function or tensor method
+                if op_name is not None and arg_vars:
+                    if hasattr(torch, op_name):
+                        code = f"torch.{op_name}({', '.join(arg_vars)})"
+                    else:
+                        tensor = arg_vars[0]
+                        method_args = ", ".join(arg_vars[1:])
+                        code = f"{tensor}.{op_name}({method_args})"
+                elif op_name is not None:
                     code = f"torch.{op_name}({', '.join(arg_vars)})"
                 else:
-                    tensor = arg_vars[0]
-                    method_args = ", ".join(arg_vars[1:])
-                    code = f"{tensor}.{op_name}({method_args})"
-            elif op_name is not None:
-                code = f"torch.{op_name}({', '.join(arg_vars)})"
-            else:
-                code = f"{node.target}({', '.join(arg_vars)})"
+                    code = f"{node.target}({', '.join(arg_vars)})"
 
             lines.append(f"{result_var} = {code}")
 
@@ -392,7 +484,11 @@ class FXToHelionConverter:
 
         # Load statements
         for p in input_params:
-            tensor_ndim = iter_ndim if p == "grad_out" else len(self.tensor_shapes[p])
+            tensor_ndim = (
+                len(self.grad_out_shape)
+                if p == "grad_out"
+                else len(self.tensor_shapes[p])
+            )
             if tensor_ndim < iter_ndim:
                 indices = ", ".join(f"tile[{i}]" for i in range(tensor_ndim))
                 load_expr = f"{p}[{indices}]"
@@ -505,13 +601,13 @@ def backward(
         assert host_function is not None
         graphs = host_function.device_ir.graphs
 
-        # Only support single RootGraphInfo (simple elementwise kernels)
-        if any(info.used_rdim for info in host_function.device_ir.rolled_reductions):
-            raise exc.AutodiffNotSupported("reduction operations")
+        # Support single RootGraphInfo (elementwise or inline reduction kernels)
         if len(graphs) != 1 or not isinstance(graphs[0], RootGraphInfo):
             for graph_info in graphs:
                 if isinstance(graph_info, ReductionLoopGraphInfo):
-                    raise exc.AutodiffNotSupported("reduction operations")
+                    raise exc.AutodiffNotSupported(
+                        "reduction operations with loop structure"
+                    )
                 if isinstance(graph_info, ForLoopGraphInfo):
                     raise exc.AutodiffNotSupported("multiple tile loops")
             raise exc.AutodiffNotSupported("multiple graphs")
@@ -519,7 +615,9 @@ def backward(
         fwd_graph = graphs[0].graph
 
         analyzer = GraphAnalyzer(fwd_graph)
-        compute_graph, input_mappings = analyzer.extract_computation_graph()
+        compute_graph, input_mappings, output_mappings = (
+            analyzer.extract_computation_graph()
+        )
 
         backward_graph = differentiate_graph(compute_graph, inputs)
 
@@ -527,6 +625,7 @@ def backward(
             backward_graph=backward_graph,
             input_mappings=input_mappings,
             input_tensors=inputs,
+            grad_out_shape=tuple(grad_out.shape),
         )
         bwd_source = converter.convert()
 
