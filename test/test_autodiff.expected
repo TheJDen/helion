@@ -60,6 +60,90 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *,
     # src[helion_bwd_6638b8a1210a.py:N]: return (grad_x, grad_y)
     return (grad_x, grad_y)
 
+--- assertExpectedJournal(TestAutodiff.test_amax_reduction)
+"""
+Auto-generated Helion backward kernel.
+"""
+
+import torch
+import helion
+from helion import language as hl
+
+@helion.kernel()
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    grad_x = torch.empty_like(x)
+    for tile in hl.tile(grad_x.shape):
+        grad_out_tile = grad_out[tile[0]]
+        x_tile = x[tile]
+        view_1_val = grad_out_tile.view(x_tile.shape[0], 1)
+        amax_val = torch.amax(x_tile, [1])
+        view_val = amax_val.view(x_tile.shape[0], 1)
+        eq_val = torch.eq(view_val, x_tile)
+        sum_1_val = torch.sum(eq_val, [1], True)
+        div_val = torch.div(view_1_val, sum_1_val)
+        mul_val = torch.mul(div_val, eq_val)
+        grad_x[tile] = mul_val
+    return grad_x
+
+--- assertExpectedJournal(TestAutodiff.test_amax_reduction)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
+@triton.jit
+def _helion_backward_kernel(grad_out, x, grad_x):
+    # src[helion_bwd_919b13a19847.py:N]: for tile in hl.tile(grad_x.shape):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[helion_bwd_919b13a19847.py:N]: grad_out_tile = grad_out[tile[0]]
+    grad_out_tile = tl.load(grad_out + indices_0 * 1, None)
+    # src[helion_bwd_919b13a19847.py:N]: x_tile = x[tile]
+    x_tile = tl.load(x + (indices_0[:, None] * 32 + indices_1[None, :] * 1), None)
+    # src[helion_bwd_919b13a19847.py:N]: view_1_val = grad_out_tile.view(x_tile.shape[0], 1)
+    view_1_val = tl.reshape(grad_out_tile, [_BLOCK_SIZE_0, 1])
+    # src[helion_bwd_919b13a19847.py:N]: amax_val = torch.amax(x_tile, [1])
+    amax_val = tl.cast(tl.max(x_tile, 1), tl.float32)
+    # src[helion_bwd_919b13a19847.py:N]: view_val = amax_val.view(x_tile.shape[0], 1)
+    view_val = tl.reshape(amax_val, [_BLOCK_SIZE_0, 1])
+    # src[helion_bwd_919b13a19847.py:N]: eq_val = torch.eq(view_val, x_tile)
+    v_0 = view_val == x_tile
+    # src[helion_bwd_919b13a19847.py:N]: sum_1_val = torch.sum(eq_val, [1], True)
+    v_1 = tl.cast(v_0, tl.int64)
+    sum_1_val = tl.cast(tl.reshape(tl.sum(v_1, 1), [_BLOCK_SIZE_0, 1]), tl.int64)
+    # src[helion_bwd_919b13a19847.py:N]: div_val = torch.div(view_1_val, sum_1_val)
+    v_2 = tl.cast(sum_1_val, tl.float32)
+    v_3 = view_1_val / v_2
+    # src[helion_bwd_919b13a19847.py:N]: mul_val = torch.mul(div_val, eq_val)
+    v_4 = tl.cast(v_0, tl.float32)
+    v_5 = v_3 * v_4
+    # src[helion_bwd_919b13a19847.py:N]: grad_x[tile] = mul_val
+    tl.store(grad_x + (indices_0[:, None] * 32 + indices_1[None, :] * 1), v_5, None)
+
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[helion_bwd_919b13a19847.py:N]: grad_x = torch.empty_like(x)
+    grad_x = torch.empty_like(x)
+    # src[helion_bwd_919b13a19847.py:N]: for tile in hl.tile(grad_x.shape):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[helion_bwd_919b13a19847.py:N]: for tile in hl.tile(grad_x.shape):
+    # src[helion_bwd_919b13a19847.py:N]:     grad_out_tile = grad_out[tile[0]]
+    # src[helion_bwd_919b13a19847.py:N]:     x_tile = x[tile]
+    # src[helion_bwd_919b13a19847.py:N-N]: ...
+    _launcher(_helion_backward_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    # src[helion_bwd_919b13a19847.py:N]: return grad_x
+    return grad_x
+
 --- assertExpectedJournal(TestAutodiff.test_exp)
 """
 Auto-generated Helion backward kernel.
@@ -475,6 +559,74 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_dad46ce1a0b8.py:N-N]: ...
     _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_dad46ce1a0b8.py:N]: return grad_x
+    return grad_x
+
+--- assertExpectedJournal(TestAutodiff.test_mean_reduction)
+"""
+Auto-generated Helion backward kernel.
+"""
+
+import torch
+import helion
+from helion import language as hl
+
+@helion.kernel()
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    grad_x = torch.empty_like(x)
+    for tile in hl.tile(grad_x.shape):
+        grad_out_tile = grad_out[tile[0]]
+        x_tile = x[tile]
+        unsqueeze_val = grad_out_tile.view(grad_out_tile.shape[0], 1)
+        expand_val = unsqueeze_val.expand_as(x_tile)
+        div_val = torch.div(expand_val, 32)
+        grad_x[tile] = div_val
+    return grad_x
+
+--- assertExpectedJournal(TestAutodiff.test_mean_reduction)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
+@triton.jit
+def _helion_backward_kernel(grad_out, grad_x):
+    # src[helion_bwd_d31084cbd6fd.py:N]: for tile in hl.tile(grad_x.shape):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[helion_bwd_d31084cbd6fd.py:N]: grad_out_tile = grad_out[tile[0]]
+    grad_out_tile = tl.load(grad_out + indices_0 * 1, None)
+    # src[helion_bwd_d31084cbd6fd.py:N]: unsqueeze_val = grad_out_tile.view(grad_out_tile.shape[0], 1)
+    unsqueeze_val = tl.reshape(grad_out_tile, [_BLOCK_SIZE_0, 1])
+    # src[helion_bwd_d31084cbd6fd.py:N]: expand_val = unsqueeze_val.expand_as(x_tile)
+    expand_val = tl.broadcast_to(unsqueeze_val, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    # src[helion_bwd_d31084cbd6fd.py:N]: div_val = torch.div(expand_val, 32)
+    v_0 = 0.03125
+    v_1 = expand_val * v_0
+    # src[helion_bwd_d31084cbd6fd.py:N]: grad_x[tile] = div_val
+    tl.store(grad_x + (indices_0[:, None] * 32 + indices_1[None, :] * 1), v_1, None)
+
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[helion_bwd_d31084cbd6fd.py:N]: grad_x = torch.empty_like(x)
+    grad_x = torch.empty_like(x)
+    # src[helion_bwd_d31084cbd6fd.py:N]: for tile in hl.tile(grad_x.shape):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[helion_bwd_d31084cbd6fd.py:N]: for tile in hl.tile(grad_x.shape):
+    # src[helion_bwd_d31084cbd6fd.py:N]:     grad_out_tile = grad_out[tile[0]]
+    # src[helion_bwd_d31084cbd6fd.py:N]:     x_tile = x[tile]
+    # src[helion_bwd_d31084cbd6fd.py:N-N]: ...
+    _launcher(_helion_backward_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1),), grad_out, grad_x, num_warps=4, num_stages=1)
+    # src[helion_bwd_d31084cbd6fd.py:N]: return grad_x
     return grad_x
 
 --- assertExpectedJournal(TestAutodiff.test_mul)
@@ -1099,6 +1251,87 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *,
     # src[helion_bwd_2af11fa45f85.py:N]: return (grad_x, grad_y)
     return (grad_x, grad_y)
 
+--- assertExpectedJournal(TestAutodiff.test_sum_mul_reduction)
+"""
+Auto-generated Helion backward kernel.
+"""
+
+import torch
+import helion
+from helion import language as hl
+
+@helion.kernel()
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    grad_x = torch.empty_like(x)
+    grad_y = torch.empty_like(y)
+    for tile in hl.tile(grad_x.shape):
+        grad_out_tile = grad_out[tile[0]]
+        x_tile = x[tile]
+        y_tile = y[tile]
+        unsqueeze_val = grad_out_tile.view(grad_out_tile.shape[0], 1)
+        expand_val = unsqueeze_val.expand_as(x_tile)
+        mul_1_val = torch.mul(expand_val, x_tile)
+        mul_2_val = torch.mul(expand_val, y_tile)
+        grad_x[tile] = mul_2_val
+        grad_y[tile] = mul_1_val
+    return (grad_x, grad_y)
+
+--- assertExpectedJournal(TestAutodiff.test_sum_mul_reduction)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
+@triton.jit
+def _helion_backward_kernel(grad_out, x, y, grad_x, grad_y):
+    # src[helion_bwd_d96a4a629b9c.py:N]: for tile in hl.tile(grad_x.shape):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[helion_bwd_d96a4a629b9c.py:N]: grad_out_tile = grad_out[tile[0]]
+    grad_out_tile = tl.load(grad_out + indices_0 * 1, None)
+    # src[helion_bwd_d96a4a629b9c.py:N]: x_tile = x[tile]
+    x_tile = tl.load(x + (indices_0[:, None] * 32 + indices_1[None, :] * 1), None)
+    # src[helion_bwd_d96a4a629b9c.py:N]: y_tile = y[tile]
+    y_tile = tl.load(y + (indices_0[:, None] * 32 + indices_1[None, :] * 1), None)
+    # src[helion_bwd_d96a4a629b9c.py:N]: unsqueeze_val = grad_out_tile.view(grad_out_tile.shape[0], 1)
+    unsqueeze_val = tl.reshape(grad_out_tile, [_BLOCK_SIZE_0, 1])
+    # src[helion_bwd_d96a4a629b9c.py:N]: expand_val = unsqueeze_val.expand_as(x_tile)
+    expand_val = tl.broadcast_to(unsqueeze_val, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    # src[helion_bwd_d96a4a629b9c.py:N]: mul_1_val = torch.mul(expand_val, x_tile)
+    v_0 = expand_val * x_tile
+    # src[helion_bwd_d96a4a629b9c.py:N]: mul_2_val = torch.mul(expand_val, y_tile)
+    v_1 = expand_val * y_tile
+    # src[helion_bwd_d96a4a629b9c.py:N]: grad_x[tile] = mul_2_val
+    tl.store(grad_x + (indices_0[:, None] * 32 + indices_1[None, :] * 1), v_1, None)
+    # src[helion_bwd_d96a4a629b9c.py:N]: grad_y[tile] = mul_1_val
+    tl.store(grad_y + (indices_0[:, None] * 32 + indices_1[None, :] * 1), v_0, None)
+
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[helion_bwd_d96a4a629b9c.py:N]: grad_x = torch.empty_like(x)
+    grad_x = torch.empty_like(x)
+    # src[helion_bwd_d96a4a629b9c.py:N]: grad_y = torch.empty_like(y)
+    grad_y = torch.empty_like(y)
+    # src[helion_bwd_d96a4a629b9c.py:N]: for tile in hl.tile(grad_x.shape):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[helion_bwd_d96a4a629b9c.py:N]: for tile in hl.tile(grad_x.shape):
+    # src[helion_bwd_d96a4a629b9c.py:N]:     grad_out_tile = grad_out[tile[0]]
+    # src[helion_bwd_d96a4a629b9c.py:N]:     x_tile = x[tile]
+    # src[helion_bwd_d96a4a629b9c.py:N-N]: ...
+    _launcher(_helion_backward_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1),), grad_out, x, y, grad_x, grad_y, num_warps=4, num_stages=1)
+    # src[helion_bwd_d96a4a629b9c.py:N]: return (grad_x, grad_y)
+    return (grad_x, grad_y)
+
 --- assertExpectedJournal(TestAutodiff.test_sum_of_products)
 """
 Auto-generated Helion backward kernel.
@@ -1185,6 +1418,70 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, z:
     _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, y, z, grad_x, grad_y, grad_z, num_warps=4, num_stages=1)
     # src[helion_bwd_8ec41d00243f.py:N]: return (grad_x, grad_y, grad_z)
     return (grad_x, grad_y, grad_z)
+
+--- assertExpectedJournal(TestAutodiff.test_sum_reduction)
+"""
+Auto-generated Helion backward kernel.
+"""
+
+import torch
+import helion
+from helion import language as hl
+
+@helion.kernel()
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    grad_x = torch.empty_like(x)
+    for tile in hl.tile(grad_x.shape):
+        grad_out_tile = grad_out[tile[0]]
+        x_tile = x[tile]
+        unsqueeze_val = grad_out_tile.view(grad_out_tile.shape[0], 1)
+        expand_val = unsqueeze_val.expand_as(x_tile)
+        grad_x[tile] = expand_val
+    return grad_x
+
+--- assertExpectedJournal(TestAutodiff.test_sum_reduction)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
+@triton.jit
+def _helion_backward_kernel(grad_out, grad_x):
+    # src[helion_bwd_7bbf36b282f5.py:N]: for tile in hl.tile(grad_x.shape):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[helion_bwd_7bbf36b282f5.py:N]: grad_out_tile = grad_out[tile[0]]
+    grad_out_tile = tl.load(grad_out + indices_0 * 1, None)
+    # src[helion_bwd_7bbf36b282f5.py:N]: unsqueeze_val = grad_out_tile.view(grad_out_tile.shape[0], 1)
+    unsqueeze_val = tl.reshape(grad_out_tile, [_BLOCK_SIZE_0, 1])
+    # src[helion_bwd_7bbf36b282f5.py:N]: expand_val = unsqueeze_val.expand_as(x_tile)
+    expand_val = tl.broadcast_to(unsqueeze_val, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    # src[helion_bwd_7bbf36b282f5.py:N]: grad_x[tile] = expand_val
+    tl.store(grad_x + (indices_0[:, None] * 32 + indices_1[None, :] * 1), expand_val, None)
+
+def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[helion_bwd_7bbf36b282f5.py:N]: grad_x = torch.empty_like(x)
+    grad_x = torch.empty_like(x)
+    # src[helion_bwd_7bbf36b282f5.py:N]: for tile in hl.tile(grad_x.shape):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[helion_bwd_7bbf36b282f5.py:N]: for tile in hl.tile(grad_x.shape):
+    # src[helion_bwd_7bbf36b282f5.py:N]:     grad_out_tile = grad_out[tile[0]]
+    # src[helion_bwd_7bbf36b282f5.py:N]:     x_tile = x[tile]
+    # src[helion_bwd_7bbf36b282f5.py:N-N]: ...
+    _launcher(_helion_backward_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1),), grad_out, grad_x, num_warps=4, num_stages=1)
+    # src[helion_bwd_7bbf36b282f5.py:N]: return grad_x
+    return grad_x
 
 --- assertExpectedJournal(TestAutodiff.test_tanh)
 """
