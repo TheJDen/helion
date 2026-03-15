@@ -115,17 +115,58 @@ class GraphAnalyzer:
                 if isinstance(value_node, Node):
                     tensor_current_value[tensor_name] = value_node
 
+            elif target_name == "_mask_to":
+                # _mask_to(tensor, fill_value) pads masked tile elements.
+                # For differentiation we skip it — AOT Autograd traces with
+                # full concrete tensors that have no masked elements.
+                input_node = node.args[0]
+                if isinstance(input_node, Node) and input_node in node_map:
+                    node_map[node] = node_map[input_node]
+
             elif not target_name.startswith("_"):
                 # Computation node: copy to computation graph
                 args = node.args
-                # Helion's strip_unused_inputs replaces duplicate node args with None when they map to the same input
-                # buffer (e.g., val * val -> mul(val, None)). We restore the real arg for differentiate_graph
+                # Helion's strip_unused_inputs replaces duplicate node args with
+                # None when they map to the same input buffer. We restore the
+                # real arg for differentiate_graph. Also check _extra_args in
+                # kwargs — Helion uses this for ops like mean/amax where the
+                # input was moved to an internal _inductor_lowering_extra node.
+                extra_args = node.kwargs.get("_extra_args")
+                if extra_args is not None and isinstance(extra_args, (list, tuple)):
+                    for ea in extra_args:
+                        if not isinstance(ea, Node):
+                            continue
+                        ea_target = ea.target
+                        ea_name = (
+                            getattr(ea_target, "__name__", "")
+                            if callable(ea_target)
+                            else ""
+                        )
+                        if ea_name == "_inductor_lowering_extra":
+                            # _extra_args -> _inductor_lowering_extra([load])
+                            # Extract the real input nodes from the list arg
+                            real_inputs = ea.args[0]
+                            if isinstance(real_inputs, (list, tuple)):
+                                for ri in real_inputs:
+                                    if isinstance(ri, Node):
+                                        args = tuple(
+                                            ri if a is None else a
+                                            for a in args
+                                        )
+                                        break
+
                 first_node_arg = next((a for a in args if isinstance(a, Node)), None)
                 if first_node_arg is not None:
                     args = tuple(first_node_arg if a is None else a for a in args)
 
                 new_args = map_arg(args, node_map.get)
-                new_kwargs = map_arg(node.kwargs, node_map.get)
+                # Strip Helion-internal kwargs
+                clean_kwargs = {
+                    k: v
+                    for k, v in node.kwargs.items()
+                    if not k.startswith("_")
+                }
+                new_kwargs = map_arg(clean_kwargs, node_map.get)
                 target = node.target
                 assert callable(target)
                 new_node = compute_graph.call_function(target, new_args, new_kwargs)
