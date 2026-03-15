@@ -123,6 +123,11 @@ class GraphAnalyzer:
                 if isinstance(input_node, Node) and input_node in node_map:
                     node_map[node] = node_map[input_node]
 
+            elif target_name in ("_host_tensor", "_get_symnode"):
+                # Helion infrastructure for tensor/symbol references.
+                # Already consumed by load/store arg processing above.
+                pass
+
             elif target_name == "_inductor_lowering_extra":
                 # Helion internal: holds references to input nodes that
                 # strip_unused_inputs moved out of the main op's args.
