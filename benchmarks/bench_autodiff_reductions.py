@@ -104,6 +104,8 @@ def bench_reduction(
     pytorch_fn: Callable[..., torch.Tensor],
     shapes: list[tuple[int, int]],
     n_inputs: int = 1,
+    autotune: bool = False,
+    autotune_effort: str | None = None,
 ) -> None:
     """Benchmark a reduction kernel's backward pass."""
     print(f"\n{'=' * 60}")
@@ -121,9 +123,15 @@ def bench_reduction(
         ]
         grad_out = torch.randn(m, device="cuda", dtype=torch.float32)
 
-        # Warm up Helion (triggers compilation)
+        # Warm up Helion (triggers compilation + optional autotuning)
         helion_kernel(*[inp.clone() for inp in inputs])
-        helion.experimental.backward(helion_kernel, grad_out, *inputs)
+        helion.experimental.backward(
+            helion_kernel,
+            grad_out,
+            *inputs,
+            autotune=autotune,
+            autotune_effort=autotune_effort,
+        )
 
         t_helion = bench_fn(_make_helion_bwd(helion_kernel, grad_out, inputs))
         t_pytorch = bench_fn(_make_pytorch_bwd(pytorch_fn, grad_out, inputs))
@@ -135,6 +143,13 @@ def bench_reduction(
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--autotune", action="store_true")
+    parser.add_argument("--autotune-effort", default=None)
+    args = parser.parse_args()
+
     shapes = [
         (1024, 512),
         (4096, 1024),
@@ -143,11 +158,20 @@ def main() -> None:
 
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}")
+    print(f"Autotune: {args.autotune} (effort={args.autotune_effort})")
 
-    bench_reduction("sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes)
-    bench_reduction("mean(x, dim=-1)", mean_kernel, lambda x: x.mean(-1), shapes)
+    kwargs = {"autotune": args.autotune, "autotune_effort": args.autotune_effort}
+
+    bench_reduction("sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes, **kwargs)
     bench_reduction(
-        "amax(x, dim=-1)", amax_kernel, lambda x: torch.amax(x, dim=-1), shapes
+        "mean(x, dim=-1)", mean_kernel, lambda x: x.mean(-1), shapes, **kwargs
+    )
+    bench_reduction(
+        "amax(x, dim=-1)",
+        amax_kernel,
+        lambda x: torch.amax(x, dim=-1),
+        shapes,
+        **kwargs,
     )
     bench_reduction(
         "(x * y).sum(-1)",
@@ -155,6 +179,7 @@ def main() -> None:
         lambda x, y: (x * y).sum(-1),
         shapes,
         n_inputs=2,
+        **kwargs,
     )
 
 
