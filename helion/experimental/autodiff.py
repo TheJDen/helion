@@ -115,7 +115,7 @@ class GraphAnalyzer:
                 if isinstance(value_node, Node):
                     tensor_current_value[tensor_name] = value_node
 
-            elif target_name not in ("_host_tensor", "_get_symnode"):
+            elif not target_name.startswith("_"):
                 # Computation node: copy to computation graph
                 args = node.args
                 # Helion's strip_unused_inputs replaces duplicate node args with None when they map to the same input
