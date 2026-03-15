@@ -514,10 +514,21 @@ class FXToHelionConverter:
     ) -> str:
         """Build the complete Helion kernel source code using AST."""
 
-        # Iteration shape comes from the first output gradient's tensor
+        # Determine iteration shape. For reductions, iterate over the
+        # grad_out shape (non-reduced dims) so that loads of input tensors
+        # use full slices on the reduced dims — matching the forward kernel's
+        # tiling structure.
         iter_var = output_grad_names[0]
         iter_tensor_name = iter_var.replace("grad_", "")
-        iter_ndim = len(self.tensor_shapes[iter_tensor_name])
+        input_ndim = len(self.tensor_shapes[iter_tensor_name])
+        grad_out_ndim = len(self.grad_out_shape)
+        is_reduction = grad_out_ndim < input_ndim
+        if is_reduction:
+            # Iterate over grad_out shape so each tile sees full rows
+            iter_var = "grad_out"
+            iter_ndim = grad_out_ndim
+        else:
+            iter_ndim = input_ndim
 
         def parse_expr(code: str) -> ast.expr:
             return ast.parse(code, mode="eval").body
@@ -570,20 +581,35 @@ class FXToHelionConverter:
                 if p == "grad_out"
                 else len(self.tensor_shapes[p])
             )
-            if tensor_ndim < iter_ndim:
+            if tensor_ndim == iter_ndim:
+                load_expr = f"{p}[tile]"
+            elif tensor_ndim > iter_ndim:
+                # Input has more dims than iteration (reduction case):
+                # use tile for iterated dims, : for reduced dims
+                indices = ["tile"] if iter_ndim == 1 else [f"tile[{i}]" for i in range(iter_ndim)]
+                indices.extend(":" for _ in range(tensor_ndim - iter_ndim))
+                load_expr = f"{p}[{', '.join(indices)}]"
+            else:
+                # Fewer dims than iteration (e.g., grad_out in elementwise)
                 indices = ", ".join(f"tile[{i}]" for i in range(tensor_ndim))
                 load_expr = f"{p}[{indices}]"
-            else:
-                load_expr = f"{p}[tile]"
             loop_body.append(parse_stmt(f"{p}_tile = {load_expr}"))
 
         # Computation statements
         for line in computation_lines:
             loop_body.append(parse_stmt(line))
 
-        # Store statements: grad_x[tile] = value
+        # Store statements: grad_x[tile, :] = value (for reductions)
         for grad_name, var_name in output_assignments:
-            loop_body.append(parse_stmt(f"{grad_name}[tile] = {var_name}"))
+            store_tensor_name = grad_name.replace("grad_", "")
+            store_ndim = len(self.tensor_shapes[store_tensor_name])
+            if store_ndim > iter_ndim:
+                indices = ["tile"] if iter_ndim == 1 else [f"tile[{i}]" for i in range(iter_ndim)]
+                indices.extend(":" for _ in range(store_ndim - iter_ndim))
+                store_idx = ", ".join(indices)
+                loop_body.append(parse_stmt(f"{grad_name}[{store_idx}] = {var_name}"))
+            else:
+                loop_body.append(parse_stmt(f"{grad_name}[tile] = {var_name}"))
 
         # For loop: for tile in hl.tile(iter_var.shape):
         body.append(

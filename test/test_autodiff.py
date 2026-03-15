@@ -3,7 +3,6 @@ from __future__ import annotations
 import operator
 import unittest
 
-import pytest
 import torch
 
 import helion
@@ -411,16 +410,8 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_out_shape=(65,),
         )
 
-    @pytest.mark.xfail(reason="backward tiles 2D grad_x, recomputes local amax per tile instead of full-row amax")
     def test_amax_reduction_boundary(self):
-        """Test amax reduction with non-divisible sizes to verify masking.
-
-        Currently fails: backward kernel tiles over 2D grad_x shape, so each
-        tile recomputes a local amax over a subset of columns rather than the
-        full row-wise amax. This produces wrong gradients at tile boundaries.
-        Fixing this requires the backward to iterate with the same tiling
-        structure as the forward (1D tiles over rows with full column access).
-        """
+        """Test amax reduction with non-divisible sizes to verify masking."""
 
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
