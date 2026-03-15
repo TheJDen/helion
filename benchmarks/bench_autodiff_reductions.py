@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
 
 import torch
@@ -98,32 +99,15 @@ def _make_pytorch_bwd(
     return fn
 
 
-def bench_reduction(
-    name: str,
+def _warmup_and_bench(
     helion_kernel: Callable[..., torch.Tensor],
-    pytorch_fn: Callable[..., torch.Tensor],
-    shapes: list[tuple[int, int]],
-    n_inputs: int = 1,
+    grad_out: torch.Tensor,
+    inputs: list[torch.Tensor],
     autotune: bool = False,
     autotune_effort: str | None = None,
-) -> None:
-    """Benchmark a reduction kernel's backward pass."""
-    print(f"\n{'=' * 60}")
-    print(f"  {name}")
-    print(f"{'=' * 60}")
-    print(
-        f"  {'Shape':>20s}  {'Helion (ms)':>12s}  {'PyTorch (ms)':>13s}  {'Speedup':>8s}"
-    )
-    print(f"  {'-' * 20}  {'-' * 12}  {'-' * 13}  {'-' * 8}")
-
-    for m, n in shapes:
-        inputs = [
-            torch.randn(m, n, device="cuda", dtype=torch.float32)
-            for _ in range(n_inputs)
-        ]
-        grad_out = torch.randn(m, device="cuda", dtype=torch.float32)
-
-        # Warm up Helion (triggers compilation + optional autotuning)
+) -> float | None:
+    """Warm up (compile + optional autotune) and benchmark. Returns median ms or None on failure."""
+    try:
         helion_kernel(*[inp.clone() for inp in inputs])
         helion.experimental.backward(
             helion_kernel,
@@ -132,24 +116,67 @@ def bench_reduction(
             autotune=autotune,
             autotune_effort=autotune_effort,
         )
+        return bench_fn(_make_helion_bwd(helion_kernel, grad_out, inputs))
+    except Exception as e:
+        print(f"    [autotune failed: {e!s:.60s}]", file=sys.stderr)
+        return None
 
-        t_helion = bench_fn(_make_helion_bwd(helion_kernel, grad_out, inputs))
+
+def bench_reduction(
+    name: str,
+    helion_kernel: Callable[..., torch.Tensor],
+    pytorch_fn: Callable[..., torch.Tensor],
+    shapes: list[tuple[int, int]],
+    n_inputs: int = 1,
+) -> None:
+    """Benchmark a reduction kernel's backward pass (default + autotuned)."""
+    print(f"\n{'=' * 72}")
+    print(f"  {name}")
+    print(f"{'=' * 72}")
+    print(
+        f"  {'Shape':>16s}  {'Default (ms)':>12s}  {'Tuned (ms)':>11s}"
+        f"  {'PyTorch (ms)':>13s}  {'Def spdup':>9s}  {'Tune spdup':>10s}"
+    )
+    print(f"  {'-' * 16}  {'-' * 12}  {'-' * 11}  {'-' * 13}  {'-' * 9}  {'-' * 10}")
+
+    for m, n in shapes:
+        inputs = [
+            torch.randn(m, n, device="cuda", dtype=torch.float32)
+            for _ in range(n_inputs)
+        ]
+        grad_out = torch.randn(m, device="cuda", dtype=torch.float32)
+
+        # Default config
+        t_default = _warmup_and_bench(helion_kernel, grad_out, inputs)
+
+        # Clear cached backward so autotuner runs fresh
+        bound = helion_kernel.bind(tuple(inputs))
+        bound._backward_compiled = None
+
+        # Autotuned
+        t_tuned = _warmup_and_bench(
+            helion_kernel, grad_out, inputs, autotune=True, autotune_effort="quick"
+        )
+
+        # PyTorch reference
         t_pytorch = bench_fn(_make_pytorch_bwd(pytorch_fn, grad_out, inputs))
 
-        speedup = t_pytorch / t_helion if t_helion > 0 else float("inf")
+        def fmt(t: float | None) -> str:
+            return f"{t:.4f}" if t is not None else "FAIL"
+
+        def spd(t: float | None, ref: float) -> str:
+            if t is None:
+                return "N/A"
+            return f"{ref / t:.2f}x"
+
+        shape_str = f"({m}, {n})"
         print(
-            f"  {f'({m}, {n})':>20s}  {t_helion:12.4f}  {t_pytorch:13.4f}  {speedup:7.2f}x"
+            f"  {shape_str:>16s}  {fmt(t_default):>12s}  {fmt(t_tuned):>11s}"
+            f"  {t_pytorch:13.4f}  {spd(t_default, t_pytorch):>9s}  {spd(t_tuned, t_pytorch):>10s}"
         )
 
 
 def main() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--autotune", action="store_true")
-    parser.add_argument("--autotune-effort", default=None)
-    args = parser.parse_args()
-
     shapes = [
         (1024, 512),
         (4096, 1024),
@@ -158,20 +185,11 @@ def main() -> None:
 
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}")
-    print(f"Autotune: {args.autotune} (effort={args.autotune_effort})")
 
-    kwargs = {"autotune": args.autotune, "autotune_effort": args.autotune_effort}
-
-    bench_reduction("sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes, **kwargs)
+    bench_reduction("sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes)
+    bench_reduction("mean(x, dim=-1)", mean_kernel, lambda x: x.mean(-1), shapes)
     bench_reduction(
-        "mean(x, dim=-1)", mean_kernel, lambda x: x.mean(-1), shapes, **kwargs
-    )
-    bench_reduction(
-        "amax(x, dim=-1)",
-        amax_kernel,
-        lambda x: torch.amax(x, dim=-1),
-        shapes,
-        **kwargs,
+        "amax(x, dim=-1)", amax_kernel, lambda x: torch.amax(x, dim=-1), shapes
     )
     bench_reduction(
         "(x * y).sum(-1)",
@@ -179,7 +197,6 @@ def main() -> None:
         lambda x, y: (x * y).sum(-1),
         shapes,
         n_inputs=2,
-        **kwargs,
     )
 
 

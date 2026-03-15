@@ -429,6 +429,22 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_out_shape=(65,),
         )
 
+    def test_error_keepdim_reduction(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :].sum(-1, keepdim=True)
+            return out
+
+        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        kernel(x)
+        grad_out = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+
+        with self.assertRaises(helion.exc.AutodiffNotSupported):
+            helion.experimental.backward(kernel, grad_out, x)
+
     def test_error_multiple_tile_loops(self):
         @helion.kernel(autotune_effort="none")
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -449,6 +465,46 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         with self.assertRaises(helion.exc.AutodiffNotSupported):
             helion.experimental.backward(kernel, grad_out, a, b)
+
+    def test_sum_reduction_large(self):
+        """Test sum reduction with larger sizes to stress tiling."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: x.sum(-1),
+            1,
+            input_shapes=[(1024, 512)],
+            grad_out_shape=(1024,),
+        )
+
+    def test_reduction_backward_autotune(self):
+        """Test that autotuning the reduction backward compiles and is correct."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: x.sum(-1),
+            1,
+            input_shapes=[(128, 64)],
+            grad_out_shape=(128,),
+            autotune=True,
+            autotune_effort="quick",
+        )
 
     def test_backward_autotune(self):
         @helion.kernel(autotune_effort="none")

@@ -453,6 +453,18 @@ class FXToHelionConverter:
 
             arg_vars = [process_arg(arg) for arg in node.args]
 
+            # Cast bool inputs to int32 before reductions to avoid Triton
+            # type mismatch in loop-carried accumulators (bool -> int64).
+            if op_name in ("sum", "mean", "prod") and node.args:
+                input_node = node.args[0]
+                if isinstance(input_node, Node):
+                    input_val = input_node.meta.get("val")
+                    if input_val is not None and input_val.dtype == torch.bool:
+                        cast_var = f"{arg_vars[0]}.to(torch.int64)"
+                        cast_name = f"{node.name}_cast"
+                        lines.append(f"{cast_name} = {cast_var}")
+                        arg_vars[0] = cast_name
+
             # Try shape-aware codegen for expand/view ops
             code = None
             if op_name is not None:
@@ -727,6 +739,29 @@ def backward(
         compute_graph, input_mappings, output_mappings = (
             analyzer.extract_computation_graph()
         )
+
+        # Reject keepdim=True reductions: grad_out would have the same ndim
+        # as inputs, making the reduction invisible to our backward codegen.
+        grad_out_ndim = len(grad_out.shape)
+        max_input_ndim = max(len(t.shape) for t in inputs)
+        if grad_out_ndim == max_input_ndim and any(
+            node.target
+            for node in fwd_graph.nodes
+            if node.op == "call_function"
+            and getattr(node.target, "_opname", None) in ("sum", "mean", "amax", "amin")
+        ):
+            # Check if any reduction ops exist — if so, this is likely keepdim=True
+            # which we don't support (grad_out shape matches input shape but
+            # the backward needs reduction-aware iteration).
+            for node in fwd_graph.nodes:
+                if node.op != "call_function":
+                    continue
+                op = getattr(node.target, "_opname", None)
+                if op in ("sum", "mean", "amax", "amin"):
+                    # Check if output shape differs from input shape
+                    val = node.meta.get("val")
+                    if val is not None and val.ndim == max_input_ndim:
+                        raise exc.AutodiffNotSupported("keepdim=True reductions")
 
         backward_graph = differentiate_graph(compute_graph, inputs)
 
