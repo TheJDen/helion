@@ -27,6 +27,8 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         grad_out_shape=None,
         autotune=False,
         autotune_effort="none",
+        rtol=1e-5,
+        atol=1e-5,
     ):
         """
         Validate helion.experimental.backward against PyTorch autograd.
@@ -67,9 +69,9 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         if isinstance(grads, tuple):
             for i, inp_pt in enumerate(inputs_pt):
-                torch.testing.assert_close(grads[i], inp_pt.grad, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(grads[i], inp_pt.grad, rtol=rtol, atol=atol)
         else:
-            torch.testing.assert_close(grads, inputs_pt[0].grad, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(grads, inputs_pt[0].grad, rtol=rtol, atol=atol)
 
         self.assertIn("backward_kernel", helion_code)
         self.assertIsNotNone(triton_code)
@@ -445,26 +447,145 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.AutodiffNotSupported):
             helion.experimental.backward(kernel, grad_out, x)
 
-    def test_error_multiple_tile_loops(self):
+    def test_matmul_backward(self):
         @helion.kernel(autotune_effort="none")
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             m, k = a.shape
             _, n = b.shape
             c = torch.zeros([m, n], dtype=a.dtype, device=a.device)
             for tile_m, tile_n in hl.tile([m, n]):
-                acc = c[tile_m, tile_n]
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
-                    acc = acc + a[tile_m, tile_k] @ b[tile_k, tile_n]
+                    acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
                 c[tile_m, tile_n] = acc
             return c
 
+        self._check_backward(
+            kernel,
+            torch.matmul,
+            2,
+            input_shapes=[(32, 64), (64, 48)],
+            grad_out_shape=(32, 48),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    def test_matmul_backward_square(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.shape
+            _, n = b.shape
+            c = torch.zeros([m, n], dtype=a.dtype, device=a.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+                c[tile_m, tile_n] = acc
+            return c
+
+        self._check_backward(
+            kernel,
+            torch.matmul,
+            2,
+            input_shapes=[(64, 64), (64, 64)],
+            grad_out_shape=(64, 64),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    def test_matmul_backward_nonsquare(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.shape
+            _, n = b.shape
+            c = torch.zeros([m, n], dtype=a.dtype, device=a.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+                c[tile_m, tile_n] = acc
+            return c
+
+        self._check_backward(
+            kernel,
+            torch.matmul,
+            2,
+            input_shapes=[(128, 32), (32, 96)],
+            grad_out_shape=(128, 96),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    def test_error_matmul_with_epilogue(self):
+        """Matmul with epilogue ops should not be matched by matmul backward."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.shape
+            _, n = b.shape
+            c = torch.zeros([m, n], dtype=a.dtype, device=a.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+                c[tile_m, tile_n] = torch.relu(acc)
+            return c
+
         a = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-        b = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(64, 48, device=DEVICE, dtype=torch.float32)
         kernel(a, b)
-        grad_out = torch.randn(32, 32, device=DEVICE, dtype=torch.float32)
+        grad_out = torch.randn(32, 48, device=DEVICE, dtype=torch.float32)
 
         with self.assertRaises(helion.exc.AutodiffNotSupported):
             helion.experimental.backward(kernel, grad_out, a, b)
+
+    def test_bmm_backward(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.shape
+            _, _, n = b.shape
+            c = torch.zeros([batch, m, n], dtype=a.dtype, device=a.device)
+            for tile_b, tile_m, tile_n in hl.tile([batch, m, n]):
+                acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.baddbmm(acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n])
+                c[tile_b, tile_m, tile_n] = acc
+            return c
+
+        self._check_backward(
+            kernel,
+            torch.bmm,
+            2,
+            input_shapes=[(4, 32, 64), (4, 64, 48)],
+            grad_out_shape=(4, 32, 48),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    def test_matmul_backward_non_divisible(self):
+        """Test matmul backward with sizes not divisible by block_size."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.shape
+            _, n = b.shape
+            c = torch.zeros([m, n], dtype=a.dtype, device=a.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+                c[tile_m, tile_n] = acc
+            return c
+
+        self._check_backward(
+            kernel,
+            torch.matmul,
+            2,
+            input_shapes=[(33, 65), (65, 47)],
+            grad_out_shape=(33, 47),
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
     def test_sum_reduction_large(self):
         """Test sum reduction with larger sizes to stress tiling."""

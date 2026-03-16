@@ -52,6 +52,19 @@ def sum_mul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def matmul_kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    c = torch.zeros([m, n], dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        c[tile_m, tile_n] = acc
+    return c
+
+
 # --- Benchmark helpers ---
 
 
@@ -128,16 +141,22 @@ def bench_reduction(
     pytorch_fn: Callable[..., torch.Tensor],
     shapes: list[tuple[int, int]],
     n_inputs: int = 1,
+    flops_per_element: int = 1,
 ) -> None:
-    """Benchmark a reduction kernel's backward pass (default + autotuned)."""
-    print(f"\n{'=' * 72}")
+    """Benchmark a reduction kernel's backward pass.
+
+    Args:
+        flops_per_element: FLOPs per input element in the backward pass.
+            Used to compute TFLOPS throughput.
+    """
+    print(f"\n{'=' * 90}")
     print(f"  {name}")
-    print(f"{'=' * 72}")
+    print(f"{'=' * 90}")
     print(
-        f"  {'Shape':>16s}  {'Default (ms)':>12s}  {'Tuned (ms)':>11s}"
-        f"  {'PyTorch (ms)':>13s}  {'Def spdup':>9s}  {'Tune spdup':>10s}"
+        f"  {'Shape':>16s}  {'Helion (ms)':>11s}  {'PyTorch (ms)':>12s}"
+        f"  {'Speedup':>8s}  {'Helion TF/s':>11s}  {'PyTorch TF/s':>12s}"
     )
-    print(f"  {'-' * 16}  {'-' * 12}  {'-' * 11}  {'-' * 13}  {'-' * 9}  {'-' * 10}")
+    print(f"  {'-' * 16}  {'-' * 11}  {'-' * 12}  {'-' * 8}  {'-' * 11}  {'-' * 12}")
 
     for m, n in shapes:
         inputs = [
@@ -147,19 +166,19 @@ def bench_reduction(
         grad_out = torch.randn(m, device="cuda", dtype=torch.float32)
 
         # Default config
-        t_default = _warmup_and_bench(helion_kernel, grad_out, inputs)
-
-        # Clear cached backward so autotuner runs fresh
-        bound = helion_kernel.bind(tuple(inputs))
-        bound._backward_compiled = None
-
-        # Autotuned
-        t_tuned = _warmup_and_bench(
-            helion_kernel, grad_out, inputs, autotune=True, autotune_effort="quick"
-        )
+        t_helion = _warmup_and_bench(helion_kernel, grad_out, inputs)
 
         # PyTorch reference
         t_pytorch = bench_fn(_make_pytorch_bwd(pytorch_fn, grad_out, inputs))
+
+        # Compute TFLOPS: total FLOPs across all inputs
+        total_elements = m * n * n_inputs
+        total_flops = total_elements * flops_per_element
+
+        def tflops(t_ms: float | None, flops: int = total_flops) -> str:
+            if t_ms is None or t_ms == 0:
+                return "N/A"
+            return f"{flops / (t_ms * 1e-3) / 1e12:.3f}"
 
         def fmt(t: float | None) -> str:
             return f"{t:.4f}" if t is not None else "FAIL"
@@ -171,8 +190,57 @@ def bench_reduction(
 
         shape_str = f"({m}, {n})"
         print(
-            f"  {shape_str:>16s}  {fmt(t_default):>12s}  {fmt(t_tuned):>11s}"
-            f"  {t_pytorch:13.4f}  {spd(t_default, t_pytorch):>9s}  {spd(t_tuned, t_pytorch):>10s}"
+            f"  {shape_str:>16s}  {fmt(t_helion):>11s}  {t_pytorch:12.4f}"
+            f"  {spd(t_helion, t_pytorch):>8s}  {tflops(t_helion):>11s}  {tflops(t_pytorch):>12s}"
+        )
+
+
+def bench_matmul_backward(
+    name: str,
+    helion_kernel: Callable[..., torch.Tensor],
+    pytorch_fn: Callable[..., torch.Tensor],
+    shapes: list[tuple[int, int, int]],
+) -> None:
+    """Benchmark a matmul kernel's backward pass."""
+    print(f"\n{'=' * 90}")
+    print(f"  {name}")
+    print(f"{'=' * 90}")
+    print(
+        f"  {'Shape':>24s}  {'Helion (ms)':>11s}  {'PyTorch (ms)':>12s}"
+        f"  {'Speedup':>8s}  {'Helion TF/s':>11s}  {'PyTorch TF/s':>12s}"
+    )
+    print(f"  {'-' * 24}  {'-' * 11}  {'-' * 12}  {'-' * 8}  {'-' * 11}  {'-' * 12}")
+
+    for m, k, n in shapes:
+        a = torch.randn(m, k, device="cuda", dtype=torch.float32)
+        b = torch.randn(k, n, device="cuda", dtype=torch.float32)
+        grad_out = torch.randn(m, n, device="cuda", dtype=torch.float32)
+        inputs = [a, b]
+
+        t_helion = _warmup_and_bench(helion_kernel, grad_out, inputs)
+
+        t_pytorch = bench_fn(_make_pytorch_bwd(pytorch_fn, grad_out, inputs))
+
+        # Matmul backward: 2 matmuls, each 2*M*K*N FLOPs
+        total_flops = 2 * 2 * m * k * n
+
+        def tflops(t_ms: float | None, flops: int = total_flops) -> str:
+            if t_ms is None or t_ms == 0:
+                return "N/A"
+            return f"{flops / (t_ms * 1e-3) / 1e12:.3f}"
+
+        def fmt(t: float | None) -> str:
+            return f"{t:.4f}" if t is not None else "FAIL"
+
+        def spd(t: float | None, ref: float) -> str:
+            if t is None:
+                return "N/A"
+            return f"{ref / t:.2f}x"
+
+        shape_str = f"({m}, {k}) x ({k}, {n})"
+        print(
+            f"  {shape_str:>24s}  {fmt(t_helion):>11s}  {t_pytorch:12.4f}"
+            f"  {spd(t_helion, t_pytorch):>8s}  {tflops(t_helion):>11s}  {tflops(t_pytorch):>12s}"
         )
 
 
@@ -186,10 +254,27 @@ def main() -> None:
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}")
 
-    bench_reduction("sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes)
-    bench_reduction("mean(x, dim=-1)", mean_kernel, lambda x: x.mean(-1), shapes)
+    # flops_per_element: approximate FLOPs per input element in the backward
+    #   sum:  expand (1 copy)
+    #   mean: expand + div (2)
+    #   amax: recompute max + eq + sum(eq) + div + mul (5)
+    #   sum_mul: expand + mul per input (2)
     bench_reduction(
-        "amax(x, dim=-1)", amax_kernel, lambda x: torch.amax(x, dim=-1), shapes
+        "sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes, flops_per_element=1
+    )
+    bench_reduction(
+        "mean(x, dim=-1)",
+        mean_kernel,
+        lambda x: x.mean(-1),
+        shapes,
+        flops_per_element=2,
+    )
+    bench_reduction(
+        "amax(x, dim=-1)",
+        amax_kernel,
+        lambda x: torch.amax(x, dim=-1),
+        shapes,
+        flops_per_element=5,
     )
     bench_reduction(
         "(x * y).sum(-1)",
@@ -197,6 +282,19 @@ def main() -> None:
         lambda x, y: (x * y).sum(-1),
         shapes,
         n_inputs=2,
+        flops_per_element=2,
+    )
+
+    matmul_shapes = [
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (2048, 2048, 2048),
+    ]
+    bench_matmul_backward(
+        "matmul backward: grad_a = grad_out @ b.T, grad_b = a.T @ grad_out",
+        matmul_kernel,
+        torch.matmul,
+        matmul_shapes,
     )
 
 

@@ -23,6 +23,16 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class MatmulPatternInfo:
+    """Information about a detected matmul pattern in the forward kernel."""
+
+    a_name: str  # left operand tensor name
+    b_name: str  # right operand tensor name
+    input_names: list[str]  # all input tensor names in order
+    batched: bool  # True for bmm/baddbmm (3D), False for mm/addmm (2D)
+
+
+@dataclass
 class InputMapping:
     placeholder_name: str
     tensor_name: str
@@ -135,9 +145,7 @@ class GraphAnalyzer:
                 pass
 
             elif target_name.startswith("_"):
-                raise exc.AutodiffNotSupported(
-                    f"Helion internal op '{target_name}'"
-                )
+                raise exc.AutodiffNotSupported(f"Helion internal op '{target_name}'")
 
             else:
                 # Computation node: copy to computation graph
@@ -157,10 +165,7 @@ class GraphAnalyzer:
                         if isinstance(real_inputs, (list, tuple)):
                             for ri in real_inputs:
                                 if isinstance(ri, Node):
-                                    args = tuple(
-                                        ri if a is None else a
-                                        for a in args
-                                    )
+                                    args = tuple(ri if a is None else a for a in args)
                                     break
 
                 first_node_arg = next((a for a in args if isinstance(a, Node)), None)
@@ -170,9 +175,7 @@ class GraphAnalyzer:
                 new_args = map_arg(args, node_map.get)
                 # Strip _extra_args (Helion-internal kwarg)
                 clean_kwargs = {
-                    k: v
-                    for k, v in node.kwargs.items()
-                    if k != "_extra_args"
+                    k: v for k, v in node.kwargs.items() if k != "_extra_args"
                 }
                 new_kwargs = map_arg(clean_kwargs, node_map.get)
                 target = node.target
@@ -180,9 +183,7 @@ class GraphAnalyzer:
                 new_node = compute_graph.call_function(target, new_args, new_kwargs)
                 if node.meta:
                     # Only preserve "val" metadata; strip Helion-internal keys
-                    new_node.meta = {
-                        k: v for k, v in node.meta.items() if k == "val"
-                    }
+                    new_node.meta = {k: v for k, v in node.meta.items() if k == "val"}
                 node_map[node] = new_node
 
         input_tensor_names = set(tensor_to_placeholder.keys())
@@ -598,7 +599,11 @@ class FXToHelionConverter:
             elif tensor_ndim > iter_ndim:
                 # Input has more dims than iteration (reduction case):
                 # use tile for iterated dims, : for reduced dims
-                indices = ["tile"] if iter_ndim == 1 else [f"tile[{i}]" for i in range(iter_ndim)]
+                indices = (
+                    ["tile"]
+                    if iter_ndim == 1
+                    else [f"tile[{i}]" for i in range(iter_ndim)]
+                )
                 indices.extend(":" for _ in range(tensor_ndim - iter_ndim))
                 load_expr = f"{p}[{', '.join(indices)}]"
             else:
@@ -616,7 +621,11 @@ class FXToHelionConverter:
             store_tensor_name = grad_name.replace("grad_", "")
             store_ndim = len(self.tensor_shapes[store_tensor_name])
             if store_ndim > iter_ndim:
-                indices = ["tile"] if iter_ndim == 1 else [f"tile[{i}]" for i in range(iter_ndim)]
+                indices = (
+                    ["tile"]
+                    if iter_ndim == 1
+                    else [f"tile[{i}]" for i in range(iter_ndim)]
+                )
                 indices.extend(":" for _ in range(store_ndim - iter_ndim))
                 store_idx = ", ".join(indices)
                 loop_body.append(parse_stmt(f"{grad_name}[{store_idx}] = {var_name}"))
@@ -658,6 +667,199 @@ class FXToHelionConverter:
         source = ast.unparse(module)
         header = '"""\nAuto-generated Helion backward kernel.\n"""\n\n'
         return header + source
+
+
+def _get_host_tensor_name(node: Node) -> str | None:
+    """Trace a node back to a _host_tensor call and return the tensor name."""
+    if node.op != "call_function":
+        return None
+    if getattr(node.target, "__name__", "") == "_host_tensor":
+        name = node.args[0]
+        return name if isinstance(name, str) else None
+    return None
+
+
+def detect_matmul_pattern(
+    graphs: list[object],
+    host_function: object,
+) -> MatmulPatternInfo | None:
+    """Detect matmul pattern from device IR graphs.
+
+    Checks for nested tile loops (ForLoopGraphInfo, not reduction) containing
+    mm/addmm operations, with no epilogue ops in the outer loop.
+
+    Returns MatmulPatternInfo if the pattern matches, None otherwise.
+    """
+    from .._compiler.device_ir import ForLoopGraphInfo
+    from .._compiler.device_ir import ReductionLoopGraphInfo
+    from .._compiler.device_ir import RootGraphInfo
+
+    # Must have non-reduction ForLoopGraphInfo (nested tile loops = matmul)
+    for_loop_graphs = [
+        g
+        for g in graphs
+        if isinstance(g, ForLoopGraphInfo) and not isinstance(g, ReductionLoopGraphInfo)
+    ]
+    if not for_loop_graphs:
+        return None
+
+    # Look for mm/addmm/bmm/baddbmm in a ForLoopGraphInfo graph
+    _MM_OPS_2D = {"mm", "addmm"}
+    _MM_OPS_3D = {"bmm", "baddbmm"}
+    _MM_OPS = _MM_OPS_2D | _MM_OPS_3D
+    mm_node = None
+    mm_op: str | None = None
+    for g in for_loop_graphs:
+        for node in g.graph.nodes:
+            if node.op == "call_function":
+                op = getattr(node.target, "_opname", None)
+                if op in _MM_OPS:
+                    mm_node = node
+                    mm_op = op
+                    break
+        if mm_node is not None:
+            break
+
+    if mm_node is None or mm_op is None:
+        return None
+    batched = mm_op in _MM_OPS_3D
+
+    # Reject epilogue ops: check the RootGraphInfo (outer loop) for
+    # computation between _phi (loop result) and store. A pure matmul
+    # has only _phi -> store; an epilogue adds ops like relu, add, etc.
+    _INFRA_OPS = {
+        "_host_tensor",
+        "_get_symnode",
+        "_for_loop",
+        "_phi",
+        "_new_var",
+        "full",
+        "getitem",
+        "load",
+        "store",
+        "sym_size.int",
+    }
+    for g in graphs:
+        if not isinstance(g, RootGraphInfo):
+            continue
+        for node in g.graph.nodes:
+            if node.op != "call_function":
+                continue
+            target = node.target
+            name = getattr(target, "__name__", None) or getattr(target, "_opname", None)
+            if name is not None and name not in _INFRA_OPS:
+                return None  # Has epilogue / extra computation
+
+    # Trace operands back through load -> _host_tensor to get tensor names.
+    # addmm/baddbmm: (acc, lhs, rhs); mm/bmm: (lhs, rhs)
+    if mm_op in ("addmm", "baddbmm"):
+        a_load, b_load = mm_node.args[1], mm_node.args[2]
+    else:
+        a_load, b_load = mm_node.args[0], mm_node.args[1]
+
+    def trace_load_to_name(load_node: object) -> str | None:
+        if not isinstance(load_node, Node):
+            return None
+        if load_node.op != "call_function":
+            return None
+        if getattr(load_node.target, "__name__", "") != "load":
+            return None
+        host_node = load_node.args[0]
+        if not isinstance(host_node, Node):
+            return None
+        return _get_host_tensor_name(host_node)
+
+    a_name = trace_load_to_name(a_load)
+    b_name = trace_load_to_name(b_load)
+    if a_name is None or b_name is None:
+        return None
+
+    # Verify these are the only two tensor params (no hidden inputs)
+    tensor_param_names = [
+        name
+        for name, val in host_function.params.arguments.items()
+        if isinstance(val, torch.Tensor)
+    ]
+    if set(tensor_param_names) != {a_name, b_name}:
+        return None
+
+    return MatmulPatternInfo(
+        a_name=a_name,
+        b_name=b_name,
+        input_names=tensor_param_names,
+        batched=batched,
+    )
+
+
+def generate_matmul_backward_source(info: MatmulPatternInfo) -> str:
+    """Generate a Helion backward kernel for matmul (2D) or bmm (3D).
+
+    Produces two matmul phases:
+      grad_a = grad_out @ b.T  (reduce over N)
+      grad_b = a.T @ grad_out  (reduce over M)
+    """
+    a = info.a_name
+    b = info.b_name
+    params = ", ".join(f"{n}: torch.Tensor" for n in info.input_names)
+
+    if info.batched:
+        # 3D: baddbmm with batch dim, permute transposes last two dims
+        return f'''\
+"""
+Auto-generated Helion backward kernel.
+"""
+
+import torch
+import helion
+from helion import language as hl
+
+@helion.kernel()
+def backward_kernel(grad_out: torch.Tensor, {params}) -> tuple[torch.Tensor, ...]:
+    batch, m, k = {a}.shape
+    _, _, n = {b}.shape
+    grad_{a} = torch.empty([batch, m, k], dtype={a}.dtype, device={a}.device)
+    grad_{b} = torch.empty([batch, k, n], dtype={b}.dtype, device={b}.device)
+    for tile_b, tile_m, tile_k in hl.tile([batch, m, k]):
+        acc = hl.zeros([tile_b, tile_m, tile_k], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            acc = torch.baddbmm(acc, grad_out[tile_b, tile_m, tile_n], {b}[tile_b, tile_k, tile_n].permute(0, 2, 1))
+        grad_{a}[tile_b, tile_m, tile_k] = acc
+    for tile_b2, tile_k2, tile_n2 in hl.tile([batch, k, n]):
+        acc2 = hl.zeros([tile_b2, tile_k2, tile_n2], dtype=torch.float32)
+        for tile_m2 in hl.tile(m):
+            acc2 = torch.baddbmm(acc2, {a}[tile_b2, tile_m2, tile_k2].permute(0, 2, 1), grad_out[tile_b2, tile_m2, tile_n2])
+        grad_{b}[tile_b2, tile_k2, tile_n2] = acc2
+    return grad_{a}, grad_{b}
+'''
+
+    # 2D: addmm, permute transposes the two dims
+    return f'''\
+"""
+Auto-generated Helion backward kernel.
+"""
+
+import torch
+import helion
+from helion import language as hl
+
+@helion.kernel()
+def backward_kernel(grad_out: torch.Tensor, {params}) -> tuple[torch.Tensor, ...]:
+    m, k = {a}.shape
+    _, n = {b}.shape
+    grad_{a} = torch.empty([m, k], dtype={a}.dtype, device={a}.device)
+    grad_{b} = torch.empty([k, n], dtype={b}.dtype, device={b}.device)
+    for tile_m, tile_k in hl.tile([m, k]):
+        acc = hl.zeros([tile_m, tile_k], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            acc = torch.addmm(acc, grad_out[tile_m, tile_n], {b}[tile_k, tile_n].permute(1, 0))
+        grad_{a}[tile_m, tile_k] = acc
+    for tile_k2, tile_n2 in hl.tile([k, n]):
+        acc2 = hl.zeros([tile_k2, tile_n2], dtype=torch.float32)
+        for tile_m2 in hl.tile(m):
+            acc2 = torch.addmm(acc2, {a}[tile_m2, tile_k2].permute(1, 0), grad_out[tile_m2, tile_n2])
+        grad_{b}[tile_k2, tile_n2] = acc2
+    return grad_{a}, grad_{b}
+'''
 
 
 def backward(
@@ -720,58 +922,64 @@ def backward(
         assert host_function is not None
         graphs = host_function.device_ir.graphs
 
-        # Reject kernels with non-reduction ForLoopGraphInfo (multiple tile loops)
-        for graph_info in graphs:
-            if isinstance(graph_info, ForLoopGraphInfo) and not isinstance(
-                graph_info, ReductionLoopGraphInfo
+        # Try matmul pattern first (nested tile loops with mm/addmm)
+        matmul_info = detect_matmul_pattern(graphs, host_function)
+        if matmul_info is not None:
+            bwd_source = generate_matmul_backward_source(matmul_info)
+        else:
+            # Reject kernels with non-reduction ForLoopGraphInfo (multiple tile loops)
+            for graph_info in graphs:
+                if isinstance(graph_info, ForLoopGraphInfo) and not isinstance(
+                    graph_info, ReductionLoopGraphInfo
+                ):
+                    raise exc.AutodiffNotSupported("multiple tile loops")
+
+            # Find the RootGraphInfo — inline reductions produce additional
+            # ReductionLoopGraphInfo graphs alongside the root, which we ignore.
+            root_graphs = [g for g in graphs if isinstance(g, RootGraphInfo)]
+            if len(root_graphs) != 1:
+                raise exc.AutodiffNotSupported("multiple graphs")
+
+            fwd_graph = root_graphs[0].graph
+
+            analyzer = GraphAnalyzer(fwd_graph)
+            compute_graph, input_mappings, output_mappings = (
+                analyzer.extract_computation_graph()
+            )
+
+            # Reject keepdim=True reductions: grad_out would have the same ndim
+            # as inputs, making the reduction invisible to our backward codegen.
+            grad_out_ndim = len(grad_out.shape)
+            max_input_ndim = max(len(t.shape) for t in inputs)
+            if grad_out_ndim == max_input_ndim and any(
+                node.target
+                for node in fwd_graph.nodes
+                if node.op == "call_function"
+                and getattr(node.target, "_opname", None)
+                in ("sum", "mean", "amax", "amin")
             ):
-                raise exc.AutodiffNotSupported("multiple tile loops")
+                # Check if any reduction ops exist — if so, this is likely
+                # keepdim=True which we don't support (grad_out shape matches
+                # input shape but backward needs reduction-aware iteration).
+                for node in fwd_graph.nodes:
+                    if node.op != "call_function":
+                        continue
+                    op = getattr(node.target, "_opname", None)
+                    if op in ("sum", "mean", "amax", "amin"):
+                        # Check if output shape differs from input shape
+                        val = node.meta.get("val")
+                        if val is not None and val.ndim == max_input_ndim:
+                            raise exc.AutodiffNotSupported("keepdim=True reductions")
 
-        # Find the RootGraphInfo — inline reductions produce additional
-        # ReductionLoopGraphInfo graphs alongside the root, which we ignore.
-        root_graphs = [g for g in graphs if isinstance(g, RootGraphInfo)]
-        if len(root_graphs) != 1:
-            raise exc.AutodiffNotSupported("multiple graphs")
+            backward_graph = differentiate_graph(compute_graph, inputs)
 
-        fwd_graph = root_graphs[0].graph
-
-        analyzer = GraphAnalyzer(fwd_graph)
-        compute_graph, input_mappings, output_mappings = (
-            analyzer.extract_computation_graph()
-        )
-
-        # Reject keepdim=True reductions: grad_out would have the same ndim
-        # as inputs, making the reduction invisible to our backward codegen.
-        grad_out_ndim = len(grad_out.shape)
-        max_input_ndim = max(len(t.shape) for t in inputs)
-        if grad_out_ndim == max_input_ndim and any(
-            node.target
-            for node in fwd_graph.nodes
-            if node.op == "call_function"
-            and getattr(node.target, "_opname", None) in ("sum", "mean", "amax", "amin")
-        ):
-            # Check if any reduction ops exist — if so, this is likely keepdim=True
-            # which we don't support (grad_out shape matches input shape but
-            # the backward needs reduction-aware iteration).
-            for node in fwd_graph.nodes:
-                if node.op != "call_function":
-                    continue
-                op = getattr(node.target, "_opname", None)
-                if op in ("sum", "mean", "amax", "amin"):
-                    # Check if output shape differs from input shape
-                    val = node.meta.get("val")
-                    if val is not None and val.ndim == max_input_ndim:
-                        raise exc.AutodiffNotSupported("keepdim=True reductions")
-
-        backward_graph = differentiate_graph(compute_graph, inputs)
-
-        converter = FXToHelionConverter(
-            backward_graph=backward_graph,
-            input_mappings=input_mappings,
-            input_tensors=inputs,
-            grad_out_shape=tuple(grad_out.shape),
-        )
-        bwd_source = converter.convert()
+            converter = FXToHelionConverter(
+                backward_graph=backward_graph,
+                input_mappings=input_mappings,
+                input_tensors=inputs,
+                grad_out_shape=tuple(grad_out.shape),
+            )
+            bwd_source = converter.convert()
 
         with tempfile.TemporaryDirectory(prefix="helion_bwd_") as cache_dir:
             source_hash = hashlib.md5(
