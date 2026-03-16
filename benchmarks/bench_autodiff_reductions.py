@@ -1,4 +1,9 @@
-"""Benchmark Helion backward vs PyTorch autograd for reduction kernels."""
+"""Benchmark Helion backward vs PyTorch autograd.
+
+Reduction backward ops (sum, mean, amax, sum_mul) are memory-bound, so we
+report achieved bandwidth (GB/s).  Matmul backward ops are compute-bound,
+so we report achieved throughput (TFLOPS).
+"""
 
 from __future__ import annotations
 
