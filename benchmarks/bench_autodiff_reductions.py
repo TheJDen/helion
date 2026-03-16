@@ -141,20 +141,21 @@ def bench_reduction(
     pytorch_fn: Callable[..., torch.Tensor],
     shapes: list[tuple[int, int]],
     n_inputs: int = 1,
-    flops_per_element: int = 1,
 ) -> None:
     """Benchmark a reduction kernel's backward pass.
 
-    Args:
-        flops_per_element: FLOPs per input element in the backward pass.
-            Used to compute TFLOPS throughput.
+    Reports achieved memory bandwidth (GB/s) since reduction backwards
+    are memory-bound (broadcast/expand), not compute-bound.
+
+    Theoretical minimum bytes: read grad_out [M] + read each input [M,N]
+    + write each grad_input [M,N] = (M + 2 * n_inputs * M * N) * 4 bytes.
     """
     print(f"\n{'=' * 90}")
     print(f"  {name}")
     print(f"{'=' * 90}")
     print(
         f"  {'Shape':>16s}  {'Helion (ms)':>11s}  {'PyTorch (ms)':>12s}"
-        f"  {'Speedup':>8s}  {'Helion TF/s':>11s}  {'PyTorch TF/s':>12s}"
+        f"  {'Speedup':>8s}  {'Helion GB/s':>11s}  {'PyTorch GB/s':>12s}"
     )
     print(f"  {'-' * 16}  {'-' * 11}  {'-' * 12}  {'-' * 8}  {'-' * 11}  {'-' * 12}")
 
@@ -171,14 +172,14 @@ def bench_reduction(
         # PyTorch reference
         t_pytorch = bench_fn(_make_pytorch_bwd(pytorch_fn, grad_out, inputs))
 
-        # Compute TFLOPS: total FLOPs across all inputs
-        total_elements = m * n * n_inputs
-        total_flops = total_elements * flops_per_element
+        # Theoretical minimum bytes: grad_out read + inputs read + grads written
+        elem_size = inputs[0].element_size()
+        total_bytes = (m + 2 * n_inputs * m * n) * elem_size
 
-        def tflops(t_ms: float | None, flops: int = total_flops) -> str:
+        def gbps(t_ms: float | None, nbytes: int = total_bytes) -> str:
             if t_ms is None or t_ms == 0:
                 return "N/A"
-            return f"{flops / (t_ms * 1e-3) / 1e12:.3f}"
+            return f"{nbytes / (t_ms * 1e-3) / 1e9:.1f}"
 
         def fmt(t: float | None) -> str:
             return f"{t:.4f}" if t is not None else "FAIL"
@@ -191,7 +192,7 @@ def bench_reduction(
         shape_str = f"({m}, {n})"
         print(
             f"  {shape_str:>16s}  {fmt(t_helion):>11s}  {t_pytorch:12.4f}"
-            f"  {spd(t_helion, t_pytorch):>8s}  {tflops(t_helion):>11s}  {tflops(t_pytorch):>12s}"
+            f"  {spd(t_helion, t_pytorch):>8s}  {gbps(t_helion):>11s}  {gbps(t_pytorch):>12s}"
         )
 
 
@@ -254,27 +255,10 @@ def main() -> None:
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}")
 
-    # flops_per_element: approximate FLOPs per input element in the backward
-    #   sum:  expand (1 copy)
-    #   mean: expand + div (2)
-    #   amax: recompute max + eq + sum(eq) + div + mul (5)
-    #   sum_mul: expand + mul per input (2)
+    bench_reduction("sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes)
+    bench_reduction("mean(x, dim=-1)", mean_kernel, lambda x: x.mean(-1), shapes)
     bench_reduction(
-        "sum(x, dim=-1)", sum_kernel, lambda x: x.sum(-1), shapes, flops_per_element=1
-    )
-    bench_reduction(
-        "mean(x, dim=-1)",
-        mean_kernel,
-        lambda x: x.mean(-1),
-        shapes,
-        flops_per_element=2,
-    )
-    bench_reduction(
-        "amax(x, dim=-1)",
-        amax_kernel,
-        lambda x: torch.amax(x, dim=-1),
-        shapes,
-        flops_per_element=5,
+        "amax(x, dim=-1)", amax_kernel, lambda x: torch.amax(x, dim=-1), shapes
     )
     bench_reduction(
         "(x * y).sum(-1)",
@@ -282,7 +266,6 @@ def main() -> None:
         lambda x, y: (x * y).sum(-1),
         shapes,
         n_inputs=2,
-        flops_per_element=2,
     )
 
     matmul_shapes = [
